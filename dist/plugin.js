@@ -1,10 +1,12 @@
-exports.version = 2
+exports.version = 2.2
 exports.description = "Two factor authentication (TOTP) for HFS logins, works with Google Authenticator, Aegis, Authy and similar apps"
-exports.apiRequired = 12.3 // finalizingLogin, beforeLoginSubmit, HFS.Btn
+exports.apiRequired = 13.4 // finalizingLogin can refuse a login. Older HFS get version 2.1 from the api12.3 branch
 exports.frontend_js = ['main.js']
 exports.repo = "damienzonly/hfs-2fa"
-exports.preview = ["https://github.com/user-attachments/assets/c7514e29-eaf2-4901-85d2-f8919d0cbc79","https://github.com/user-attachments/assets/89e0c41b-6a74-4c6a-becc-072517c72d97","https://github.com/user-attachments/assets/8edb44a7-7949-4242-8fa7-de18da0e48e4","https://github.com/user-attachments/assets/e4f4ea64-ac6a-4274-84ea-9a1078c5f99f"]
+exports.preview = ["https://github.com/user-attachments/assets/89e0c41b-6a74-4c6a-becc-072517c72d97","https://github.com/user-attachments/assets/8edb44a7-7949-4242-8fa7-de18da0e48e4","https://github.com/user-attachments/assets/e4f4ea64-ac6a-4274-84ea-9a1078c5f99f"]
 exports.changelog = [
+    { "version": 2.2, "message": "Requires HFS 3.3 or newer, and only uses its official login veto. HFS 3.2 and older automatically get version 2.1." },
+    { "version": 2.1, "message": "On HFS 3.3 and newer, logins are refused through the official finalizingLogin veto. A refused login no longer logs out a session that was already verified." },
     { "version": 2, "message": "Security fixes: 2FA was not enforced on recent HFS versions, and could be bypassed by typing the username with different letter case. Added replay protection, throttling of wrong codes, confirmation of new setups, a code to disable 2FA, admin reset. Replaced the deprecated speakeasy library." }
 ]
 
@@ -30,24 +32,24 @@ exports.init = async api => {
 
     const MARK = 'hfs2fa' 
     const DENIED = Symbol('hfs2fa denied')
-    const RESTORE = Symbol('hfs2fa restore')
     const OTP_REQUIRED = 'OTP required'
     const WINDOW = 1 // accepted clock drift, in 30 seconds steps
     const FREE_ATTEMPTS = 5 
     const THROTTLE_BASE = 30_000, THROTTLE_MAX = 15 * 60_000
     const SETUP_TTL = 10 * 60_000
-    const LOGIN_API = (api.Const?.API_URI || '/~/api/') + 'login' 
+    const LOGIN_API = (api.Const?.API_URI || '/~/api/') + 'login'
     const failures = new Map() // username { count, until }
     const lastSteps = new Map() // username last accepted time step, stops concurrent replays before the db is updated
     const setups = new Map() // username { secret, expires }, waiting for confirmation
 
-    // hfs ignores exceptions thrown by plugins event listeners, so throwing here would not stop the login
+    // returning a message refuses the login. throwing wouldn't: hfs ignores exceptions thrown by plugins event listeners
     api.events.on('finalizingLogin', async ({ ctx, username, inputs }) => {
         // credentials in this request? otherwise the login comes from the configuration, like auto_login_net
         const hard = ctx.originalUrl.startsWith(LOGIN_API) || 'login' in ctx.query || Boolean(ctx.get('authorization'))
+        const mark = ctx.session?.[MARK]
         try {
             delete ctx.session[MARK]
-            // the event carries the username as typed (e.g. admin with srp login), while our records use the canonical one
+            // records use the canonical username, which hfs 3.3 already passes: getAccount keeps it safe anyway
             const user = api.getAccount(username)?.username
             const record = user && await db.get(user)
             if (!record) return
@@ -58,11 +60,11 @@ exports.init = async api => {
             }
             if (hard && error !== OTP_REQUIRED)
                 api.log(`login of ${user} from ${ctx.ip} refused: ${error}`)
-            denyLogin(ctx, error, hard)
+            return denyLogin(ctx, error, hard, mark)
         }
         catch (e) {
             api.log(`2FA check failed: ${e?.message || e}`)
-            denyLogin(ctx, '2FA check failed', hard)
+            return denyLogin(ctx, '2FA check failed', hard, mark)
         }
     })
 
@@ -200,39 +202,22 @@ exports.init = async api => {
             map.delete(user)
     }
 
-    function denyLogin(ctx, message, hard) {
+    // returns what the finalizingLogin listener must return
+    function denyLogin(ctx, message, hard, mark) {
         ctx.state[DENIED] = message
         const s = ctx.session
-        if (!hard || !s) return // without credentials in the request we let the login finish, and our middleware undoes it
-        // setLoggedIn() proceeds assigning session.username we make that assignment throw, so the login stops before the
-        // session is saved and before the login event, and hfs answers 401 with our message
-        const prev = Object.getOwnPropertyDescriptor(s, 'username')
-        const restore = ctx.state[RESTORE] = () => {
-            delete ctx.state[RESTORE]
-            delete s.username
-            if (prev)
-                Object.defineProperty(s, 'username', prev)
-        }
-        Object.defineProperty(s, 'username', {
-            configurable: true,
-            enumerable: true,
-            get: () => prev?.value,
-            set() {
-                restore()
-                delete ctx.state.account
-                throw Object.assign(new Error(message), { name: '', status: 401, expose: true }) // name='' makes String(error) just the message
-            },
-        })
+        // without credentials in the request (e.g. auto_login_net) we let the login finish, and our middleware undoes it:
+        // refusing would answer 401 to every request of that network, and get it blocked by antibrute
+        if (!hard || !s) return
+        if (mark !== undefined)
+            s[MARK] = mark // the login won't happen, so the session keeps the identity it already verified
+        return message // hfs refuses the login with a 401 and this message
     }
 
     // defense in depth, on every request an account with 2FA must have passed our check in this session, whatever
     // the way it logged in this also logs out sessions opened before 2FA was enabled, or with version 1 of this plugin.
     async function enforce(ctx, upstream) {
         try {
-            if (ctx.state[RESTORE]) { // still there = hfs never assigned session.username, so our refusal didnt stop it
-                ctx.state[RESTORE]()
-                api.log("warning: refusing a login didn't stop HFS, the login is being undone here instead. Please report this with your HFS version")
-            }
             const user = api.getCurrentUsername(ctx)
             if (!user || ctx.session?.[MARK] === user) return
             if (!await has2fa(user)) return
