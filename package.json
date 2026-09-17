@@ -1,12 +1,12 @@
 {
   "name": "hfs-2fa",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "private": true,
   "description": "TOTP two factor authentication plugin for HFS",
   "license": "GPL-3.0",
   "scripts": {
     "build": "bash build_deps.sh",
-    "test": "node --test"
+    "test": "node --test \"test/*.test.js\""
   },
   "dependencies": {
     "qrcode": "1.5.4"
