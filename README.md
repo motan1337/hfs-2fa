@@ -3,7 +3,8 @@
 This plugin adds TOTP two factor authentication to HFS logins, with any authenticator app
 (Google Authenticator, Aegis, Authy, 1Password, etc)
 
-Requires HFS with plugin API 12.3 or newer.
+Requires HFS 3.3 or newer (plugin API 13.4). HFS 3.2 and older automatically get version 2.1 of this
+plugin, from the api12.3 branch. HFS words a refused login as "UnauthorizedError: Invalid OTP".
 
 ## Enabling it
 
