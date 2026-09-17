@@ -1,6 +1,7 @@
 'use strict'
-// emulates the parts of hfs the plugin interacts with ( src/auth.ts setLoggedIn, src/plugins.ts listener trap and
-// middleware, src/api.auth.ts login/loginSrp2, src/middlewares.ts prepareState), and checks that 2FA is really enforced
+// emulates the parts of hfs 3.3 the plugin interacts with (src/auth.ts setLoggedIn, src/plugins.ts listener trap and
+// middleware, src/api.auth.ts login/loginSrp2, src/middlewares.ts prepareState), and checks that 2FA is really enforced.
+// the tests for hfs 3.2 and older live in the api12.3 branch, with the version of the plugin that supports them
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const totp = require('../dist/totp')
@@ -10,6 +11,7 @@ const SECRET = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP'
 const code = (offset = 0, secret = SECRET) => totp.hotp(totp.base32Decode(secret), totp.timeStep() + offset)
 const wrongCode = () => code(-10) // outside the accepted window
 const tick = () => new Promise(resolve => setImmediate(resolve))
+const refusal = text => 'UnauthorizedError: ' + text // how hfs words a refused login
 
 async function setup() {
     const listeners = new Map()
@@ -19,7 +21,7 @@ async function setup() {
     }
     const emit = (name, ...args) => [...listeners.get(name) || []].map(cb => cb(...args, { event: name }))
     const emitAsync = (name, ...args) => Promise.all(emit(name, ...args))
-    // plugins.ts exceptions of plugins listeners are logged and ignored
+    // plugins.ts exceptions of plugins listeners are logged and ignored, returned values pass through
     const trap = cb => (...args) => {
         try {
             const ret = cb(...args)
@@ -33,7 +35,7 @@ async function setup() {
     on('login', () => fired.push('login'))
     on('failedLogin', () => fired.push('failedLogin'))
     const api = {
-        Const: { API_URI: '/~/api/' },
+        Const: { API_URI: '/~/api/', API_VERSION: 13.4 },
         events: { on: (name, cb) => on(name, trap(cb)) },
         getAccount,
         getCurrentUsername: ctx => ctx.state.account?.username || '',
@@ -63,7 +65,14 @@ async function setup() {
         delete s.loggingIn
         const a = ctx.state.account = getAccount(username)
         if (!a) return
-        await emitAsync('finalizingLogin', { ctx, username, inputs: { ...ctx.state.params, ...ctx.query } })
+        const inputs = { ...ctx.state.params, ...ctx.query }
+        const result = await emitAsync('finalizingLogin', { ctx, username: a.username, inputs })
+        const error = result.find(x => x && typeof x === 'string')
+        if (error) {
+            ctx.state.account = getAccount(s.username)
+            delete ctx.state.usernames
+            throw Object.assign(new Error(error), { name: 'UnauthorizedError', status: 401, expose: true }) // like koa ctx.throw
+        }
         const normalized = username.toLowerCase()
         if (s.username !== normalized)
             delete s.allowNet
@@ -87,7 +96,13 @@ async function setup() {
         const loggedInNotBySession = a
         ctx.state.account = a ||= getAccount(s.username)
         if (a && loggedInNotBySession)
-            await setLoggedIn(ctx, a.username)
+            try {
+                await setLoggedIn(ctx, a.username)
+            }
+            catch (e) {
+                emit('failedLogin')
+                return Object.assign(ctx, { status: 401, body: String(e) })
+            }
         const after = await pl.middleware(ctx)
         if (apiHandler)
             Object.assign(ctx, await apiHandler(ctx))
@@ -101,6 +116,7 @@ async function setup() {
             await setLoggedIn(ctx, getAccount(username).username)
         }
         catch (e) {
+            emit('failedLogin')
             return { status: 401, body: String(e) }
         }
         return { status: 200, body: { username: ctx.state.account?.username } }
@@ -136,11 +152,12 @@ test('login is refused without a valid OTP, and nothing reaches the session', as
     for (const [otp, error] of attempts) {
         const ctx = await t.request(t.loginCtx(otp), t.loginApi('alice'))
         assert.equal(ctx.status, 401)
-        assert.equal(ctx.body, error)
+        assert.equal(ctx.body, refusal(error))
         assert.equal(ctx.session.username, undefined)
         assert.equal(ctx.state.account, undefined)
     }
-    assert.deepEqual(t.fired, []) // the login event was never emitted
+    assert.ok(!t.fired.includes('login')) // the login event was never emitted
+    assert.equal(t.fired.length, attempts.length) // failedLogin, counted by antibrute
 })
 
 test('a valid OTP logs in, and can be used only once', async () => {
@@ -154,7 +171,7 @@ test('a valid OTP logs in, and can be used only once', async () => {
     assert.deepEqual(Object.keys(t.store.get('alice')).sort(), ['base32', 'lastStep']) // redundant copies of the secret dropped
     const replay = await t.request(t.loginCtx(otp), t.loginApi('alice'))
     assert.equal(replay.status, 401)
-    assert.equal(replay.body, 'Invalid OTP')
+    assert.equal(replay.body, refusal('Invalid OTP'))
     const next = await t.request(t.loginCtx(code(1)), t.loginApi('alice'))
     assert.equal(next.status, 200)
 })
@@ -165,8 +182,9 @@ test('SRP login with the username in a different case still requires the OTP', a
     const srpCtx = otp => t.ctxFor({ url: '/~/api/loginSrp2', params: { otp }, session: { loggingIn: { username: 'ALICE' } } })
     const bad = await t.request(srpCtx(''), t.srpApi)
     assert.equal(bad.status, 401)
+    assert.equal(bad.body, refusal('OTP required'))
     assert.equal(bad.session.username, undefined)
-    assert.deepEqual(t.fired, ['failedLogin']) // counted by hfs antibrute
+    assert.deepEqual(t.fired, ['failedLogin'])
     const good = await t.request(srpCtx(code()), t.srpApi)
     assert.equal(good.status, 200)
     assert.equal(good.session.username, 'alice')
@@ -175,11 +193,23 @@ test('SRP login with the username in a different case still requires the OTP', a
 test('basic auth without ?otp= is refused with a 401 error', async () => {
     const t = await setup()
     t.store.set('alice', { base32: SECRET })
-    await assert.rejects(t.request(t.ctxFor({ authorization: 'alice' })),
-        e => e.status === 401 && e.expose && String(e) === 'OTP required')
+    const refused = await t.request(t.ctxFor({ authorization: 'alice' }))
+    assert.equal(refused.status, 401)
+    assert.equal(refused.body, refusal('OTP required'))
+    assert.equal(refused.session.username, undefined)
     const ctx = await t.request(t.ctxFor({ authorization: 'alice', query: { otp: code() } }))
     assert.equal(ctx.session.username, 'alice')
     assert.equal(ctx.state.account.username, 'alice')
+})
+
+test('logins without credentials are not refused, but undone', async () => {
+    const t = await setup()
+    t.store.set('alice', { base32: SECRET })
+    const auto = await t.request(t.ctxFor({ autoLogin: 'alice' })) // auto_login_net
+    assert.notEqual(auto.status, 401) // refusing would answer 401 to the whole network, login page included
+    assert.ok(!t.fired.includes('failedLogin')) // and antibrute would end up blocking it
+    assert.equal(auto.state.account, undefined)
+    assert.equal(auto.session.username, undefined)
 })
 
 test('sessions that did not pass the OTP check are logged out', async () => {
@@ -188,31 +218,32 @@ test('sessions that did not pass the OTP check are logged out', async () => {
     const old = await t.request(t.ctxFor({ session: { username: 'alice' } })) // other device or version 1
     assert.equal(old.state.account, undefined)
     assert.equal(old.session.username, undefined)
-    const auto = await t.request(t.ctxFor({ autoLogin: 'alice' })) // auto_login_net
-    assert.equal(auto.state.account, undefined)
-    assert.equal(auto.session.username, undefined)
     const verified = await t.request(t.loginCtx(code()), t.loginApi('alice'))
     const next = await t.request(t.ctxFor({ session: verified.session }))
     assert.equal(next.state.account.username, 'alice')
 })
 
-test('a refused login for another account keeps the current one', async () => {
+test('a refused login keeps the current identity, and its verification', async () => {
     const t = await setup()
     t.store.set('alice', { base32: SECRET })
-    const ctx = await t.request(t.loginCtx(wrongCode(), { username: 'bob' }), t.loginApi('alice'))
-    assert.equal(ctx.status, 401)
-    assert.equal(ctx.session.username, 'bob')
-    assert.equal((await t.request(t.ctxFor({ session: ctx.session }))).state.account.username, 'bob')
+    const other = await t.request(t.loginCtx(wrongCode(), { username: 'bob' }), t.loginApi('alice'))
+    assert.equal(other.status, 401)
+    assert.equal(other.session.username, 'bob')
+    assert.equal((await t.request(t.ctxFor({ session: other.session }))).state.account.username, 'bob')
+    const verified = await t.request(t.loginCtx(code()), t.loginApi('alice'))
+    const again = await t.request(t.loginCtx(wrongCode(), verified.session), t.loginApi('alice'))
+    assert.equal(again.status, 401)
+    assert.equal((await t.request(t.ctxFor({ session: again.session }))).state.account?.username, 'alice')
 })
 
 test('wrong codes are throttled', async () => {
     const t = await setup()
     t.store.set('alice', { base32: SECRET })
     for (let i = 0; i < 5; i++)
-        assert.equal((await t.request(t.loginCtx(wrongCode()), t.loginApi('alice'))).body, 'Invalid OTP')
+        assert.equal((await t.request(t.loginCtx(wrongCode()), t.loginApi('alice'))).body, refusal('Invalid OTP'))
     const ctx = await t.request(t.loginCtx(code()), t.loginApi('alice'))
     assert.equal(ctx.status, 401)
-    assert.match(ctx.body, /^Too many wrong codes/)
+    assert.match(ctx.body, /Too many wrong codes/)
 })
 
 test('setup must be confirmed with a code, the secret is not disclosed afterwards, disabling requires a code', async () => {
