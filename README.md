@@ -1,4 +1,4 @@
-### For personal reasons, and since the original maintainer and creator no longer is active and maintains the 2fa pluging, I moved the projects in my own repos. This fork is now archived.
+### For personal reasons, and since the original maintainer and creator no longer is active and maintains the 2fa plugin, I moved the projects in my own repos. This fork is now archived.
 ### The plugin was rebuild from scratch and no longer holds is a plugin made by the oc.
 ### Repos: https://github.com/motan1337/2fa-totp-legacy-plus for legacy and current hfs versions: https://github.com/motan1337/2fa-totp-plus
 
